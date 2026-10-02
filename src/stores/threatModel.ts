@@ -8,7 +8,21 @@ import type {
   ThreatModelState,
   VersionSnapshot,
 } from '@/models/domain'
-import { createId, loadState, resetState, saveState } from '@/services/repository'
+import {
+  commitStateTransactionally,
+  createId,
+  loadPersistedState,
+  loadState,
+  resetState,
+  saveState,
+  withModelTransactionLock,
+} from '@/services/repository'
+import {
+  applySplitThreats,
+  revokeSplitThreats,
+  type SplitThreatsRequest,
+  type SplitThreatsResult,
+} from '@/services/threatSplit'
 import {
   dashboardMetrics,
   decisionsForThreat,
@@ -46,6 +60,19 @@ export const useThreatModelStore = defineStore('threat-model', () => {
   const persist = (): void => {
     saveState(data.value)
     lastSavedAt.value = new Date().toISOString()
+  }
+
+  const reloadPersistedState = (): void => {
+    data.value = loadPersistedState()
+    lastSavedAt.value = new Date().toISOString()
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('storage', (event) => {
+      if (event.key?.startsWith('scapex-threat-model') || event.key === null) {
+        reloadPersistedState()
+      }
+    })
   }
 
   const appendAudit = (
@@ -220,6 +247,28 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     persist()
   }
 
+  const splitThreats = async (request: SplitThreatsRequest): Promise<SplitThreatsResult> =>
+    withModelTransactionLock(async () => {
+      const latest = loadPersistedState()
+      const { state: nextState, result } = applySplitThreats(latest, request)
+      if (!result.duplicated) {
+        commitStateTransactionally(latest, nextState)
+      }
+      data.value = loadPersistedState()
+      lastSavedAt.value = new Date().toISOString()
+      return result
+    })
+
+  const revokeThreatSplit = async (operationId: string): Promise<void> => {
+    await withModelTransactionLock(async () => {
+      const latest = loadPersistedState()
+      const nextState = revokeSplitThreats(latest, operationId)
+      commitStateTransactionally(latest, nextState)
+      data.value = loadPersistedState()
+      lastSavedAt.value = new Date().toISOString()
+    })
+  }
+
   const resetDemo = (): void => {
     data.value = resetState()
     lastSavedAt.value = new Date().toISOString()
@@ -282,6 +331,9 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     updateMitigationStatus,
     acceptRisk,
     closeRisk,
+    splitThreats,
+    revokeThreatSplit,
+    reloadPersistedState,
     resetDemo,
     exportReport,
     reviewProgress,

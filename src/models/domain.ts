@@ -112,6 +112,9 @@ export interface Threat {
   riskIds: string[]
   reviewStatus: ReviewStatus
   revision: number
+  parentThreatId?: string
+  splitOperationId?: string
+  splitParent?: boolean
 }
 
 export interface MitigationTask {
@@ -125,6 +128,8 @@ export interface MitigationTask {
   detail: string
   evidenceIds: string[]
   conflictGroup?: string
+  sourceThreatId?: string
+  splitOperationId?: string
 }
 
 export interface ReviewDecision {
@@ -136,6 +141,36 @@ export interface ReviewDecision {
   comment: string
   createdAt: string
   revision: number
+}
+
+export interface SplitOperationChild {
+  threatId: string
+  code: string
+  title: string
+  description: string
+  severity: Severity
+  componentIds: string[]
+  flowIds: string[]
+  externalDependencyIds: string[]
+  attackPathIds: string[]
+  controlIds: string[]
+  riskIds: string[]
+  mitigationIds: string[]
+}
+
+export interface SplitOperation {
+  id: string
+  requestKey: string
+  parentThreatId: string
+  childThreatIds: string[]
+  migratedMitigationIds: string[]
+  children?: SplitOperationChild[]
+  createdAt: string
+  revokedAt?: string
+  previousParentReviewStatus: ReviewStatus
+  previousParentRevision: number
+  versionId?: string
+  previousVersionId?: string
 }
 
 export interface VersionSnapshot {
@@ -176,6 +211,7 @@ export interface ThreatModelState {
   risks: Risk[]
   mitigations: MitigationTask[]
   decisions: ReviewDecision[]
+  splitOperations: SplitOperation[]
   versions: VersionSnapshot[]
   audit: AuditEvent[]
   currentRevision: number
