@@ -112,6 +112,14 @@ export interface Threat {
   riskIds: string[]
   reviewStatus: ReviewStatus
   revision: number
+  /** 父子拆分：直接父威胁 id；主威胁自身不携带该字段 */
+  parentThreatId?: string
+  /** 拆分谱系根威胁 id，多级拆分时保持不变 */
+  rootThreatId?: string
+  /** 最近一次拆分操作 id，用于谱系展示 */
+  splitGroupId?: string
+  /** 来源威胁 id；旧数据迁移时按原威胁回填（即威胁自身 id） */
+  originThreatId?: string
 }
 
 export interface MitigationTask {
@@ -125,6 +133,53 @@ export interface MitigationTask {
   detail: string
   evidenceIds: string[]
   conflictGroup?: string
+  /** 来源威胁 id；旧数据迁移时按原威胁回填（即 threatId） */
+  originThreatId?: string
+}
+
+/** 拆分时按场景声明的子威胁输入（对象 id 必须来自父威胁） */
+export interface SplitChildInput {
+  title: string
+  scenario: string
+  severity: Severity
+  componentIds: string[]
+  flowIds: string[]
+  externalDependencyIds: string[]
+  attackPathIds: string[]
+  controlIds: string[]
+  riskIds: string[]
+  /** 从主威胁迁移到子威胁的现有缓解任务 id */
+  mitigationIds: string[]
+}
+
+export interface SplitThreatRequest {
+  parentThreatId: string
+  /** 打开拆分窗口时父威胁的修订号，用于乐观并发控制 */
+  baseRevision: number
+  children: SplitChildInput[]
+}
+
+export interface SplitOperation {
+  id: string
+  idempotencyKey: string
+  parentThreatId: string
+  parentRevisionBefore: number
+  /** 拆分前父威胁的完整快照，撤销时原样恢复 */
+  parentSnapshot: Threat
+  /** 本次拆分落库的子威胁 */
+  children: Threat[]
+  /** 迁移到子威胁的缓解任务 id */
+  assignedMitigationIds: string[]
+  status: 'committed' | 'undone'
+  actor: string
+  createdAt: string
+  undoneAt?: string
+}
+
+export interface SplitResult {
+  operation: SplitOperation
+  /** true 表示命中并发去重，返回的是另一个窗口已生成的同一份结果 */
+  deduplicated: boolean
 }
 
 export interface ReviewDecision {
@@ -178,6 +233,11 @@ export interface ThreatModelState {
   decisions: ReviewDecision[]
   versions: VersionSnapshot[]
   audit: AuditEvent[]
+  splitOperations: SplitOperation[]
+  /** 本地持久化结构版本；旧数据（无该字段）加载时迁移并回填来源 */
+  schemaVersion?: number
+  /** 最近一次旧数据迁移时间 */
+  migratedAt?: string
   currentRevision: number
 }
 

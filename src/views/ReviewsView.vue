@@ -45,8 +45,15 @@ const form = reactive<{
 
 const latestVersion = computed(() => store.data.versions[0])
 const affectedThreats = computed(() => {
-  const ids = latestVersion.value?.affectedThreatIds ?? store.data.threats.map((threat) => threat.id)
-  return store.data.threats.filter((threat) => ids.includes(threat.id))
+  const ids = new Set(
+    latestVersion.value?.affectedThreatIds ?? store.data.threats.map((threat) => threat.id),
+  )
+  // 拆分产生的子威胁（以及重新进入会签的主威胁）单独进入会签，
+  // 即使不在上一版本快照的受影响清单中也要展示。
+  store.data.threats.forEach((threat) => {
+    if (threat.reviewStatus === 'in_review') ids.add(threat.id)
+  })
+  return store.data.threats.filter((threat) => ids.has(threat.id))
 })
 const selectedThreat = computed(
   () => store.data.threats.find((threat) => threat.id === selectedThreatId.value) ?? null,
@@ -100,6 +107,9 @@ const decisionLabel = (decision: DecisionType | 'pending'): string =>
   decision === 'pending'
     ? '待提交'
     : decisionOptions.find((item) => item.value === decision)?.label ?? decision
+
+const parentCode = (parentThreatId: string): string =>
+  store.data.threats.find((threat) => threat.id === parentThreatId)?.code ?? parentThreatId
 </script>
 
 <template>
@@ -140,6 +150,10 @@ const decisionLabel = (decision: DecisionType | 'pending'): string =>
             <div>
               <span class="mono">{{ threat.code }}</span>
               <h2>{{ threat.title }}</h2>
+              <span v-if="threat.parentThreatId" class="lineage-chip">
+                <i class="pi pi-sitemap"></i>
+                子威胁 · 源自 {{ parentCode(threat.parentThreatId) }}
+              </span>
             </div>
             <StatusTag :value="threat.reviewStatus" kind="review" />
           </div>
@@ -292,6 +306,18 @@ const decisionLabel = (decision: DecisionType | 'pending'): string =>
 .decision-head h2 {
   margin: 6px 0 0;
   font-size: 16px;
+}
+
+.lineage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #eef3fa;
+  color: #41658f;
+  font-size: 10px;
 }
 
 .role-grid {

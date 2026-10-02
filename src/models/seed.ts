@@ -515,5 +515,7 @@ export const createSeedState = (): ThreatModelState => ({
   decisions,
   versions: baselineVersions,
   audit,
+  splitOperations: [],
+  schemaVersion: 2,
   currentRevision: 2,
 })

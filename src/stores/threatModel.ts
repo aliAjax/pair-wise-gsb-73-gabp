@@ -8,13 +8,34 @@ import type {
   ThreatModelState,
   VersionSnapshot,
 } from '@/models/domain'
-import { createId, loadState, resetState, saveState } from '@/services/repository'
+import {
+  createId,
+  loadStateWithMeta,
+  resetState,
+  saveState,
+  subscribeToExternalChanges,
+} from '@/services/repository'
 import {
   dashboardMetrics,
   decisionsForThreat,
   getValidationIssues,
   reviewProgress,
 } from '@/services/selectors'
+import { undoSplit, undoBlockers } from '@/services/splitEngine'
+import {
+  executeSplit,
+  pendingCheckpointCount,
+  recoverPendingSplits,
+  type RecoveryReport,
+} from '@/services/splitService'
+import {
+  browserKV,
+  isFailureInjectionEnabled,
+  listCheckpoints,
+  markCheckpointUndone,
+  setFailureInjection,
+} from '@/services/splitLedger'
+import type { SplitResult, SplitThreatRequest } from '@/models/domain'
 
 type CollectionKey =
   | 'zones'
@@ -34,8 +55,26 @@ interface IdentifiedEntity {
 }
 
 export const useThreatModelStore = defineStore('threat-model', () => {
-  const data = ref<ThreatModelState>(loadState())
+  const initial = loadStateWithMeta()
+  const data = ref<ThreatModelState>(initial.state)
   const lastSavedAt = ref(new Date().toISOString())
+  const lastMigrationAt = ref(initial.migrated ? initial.state.migratedAt ?? null : null)
+  const startupRecovery = ref<RecoveryReport | null>(null)
+  const failureInjectionOn = ref(isFailureInjectionEnabled(browserKV))
+
+  // 启动时从检查点恢复上次未完成的拆分（跨窗口提交后本窗口崩溃也可自愈）。
+  const pendingAtBoot = pendingCheckpointCount()
+  if (pendingAtBoot > 0) {
+    const recovery = recoverPendingSplits()
+    data.value = recovery.state
+    startupRecovery.value = recovery.report
+  }
+
+  // 另一个窗口写入后，本窗口回读同一份状态，避免覆盖并发结果。
+  subscribeToExternalChanges(() => {
+    const reloaded = loadStateWithMeta()
+    data.value = reloaded.state
+  })
 
   const metrics = computed(() => dashboardMetrics(data.value))
   const issues = computed(() => getValidationIssues(data.value))
@@ -220,9 +259,77 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     persist()
   }
 
+  /**
+   * 提交父子拆分。
+   * 账本协调 + 确定性 id：另一个窗口提交了相同拆分时返回 deduplicated=true。
+   * 写入失败时抛 SplitSubmissionError，调用方提示从检查点恢复。
+   */
+  const submitSplit = (request: SplitThreatRequest): SplitResult => {
+    const outcome = executeSplit(data.value, request)
+    data.value = outcome.state
+    lastSavedAt.value = new Date().toISOString()
+    return outcome.result
+  }
+
+  /**
+   * 模拟两个窗口同时提交同一份拆分：
+   * 第二次提交必须命中去重，最终只生成一份结果。
+   */
+  const simulateConcurrentSplit = (
+    request: SplitThreatRequest,
+  ): { first: SplitResult; second: SplitResult } => {
+    const firstOutcome = executeSplit(data.value, request)
+    data.value = firstOutcome.state
+    // 第二个窗口：不使用第一个窗口的内存状态，而是像真实窗口一样回读持久化状态。
+    const reloaded = loadStateWithMeta().state
+    const secondOutcome = executeSplit(reloaded, request)
+    data.value = secondOutcome.state
+    lastSavedAt.value = new Date().toISOString()
+    return { first: firstOutcome.result, second: secondOutcome.result }
+  }
+
+  /** 手动触发检查点恢复（启动时已自动执行一次）。 */
+  const recoverSplits = (): RecoveryReport => {
+    const outcome = recoverPendingSplits()
+    data.value = outcome.state
+    lastSavedAt.value = new Date().toISOString()
+    return outcome.report
+  }
+
+  const pendingCheckpoints = computed(() => listCheckpoints())
+
+  const toggleFailureInjection = (enabled: boolean): void => {
+    setFailureInjection(enabled, browserKV)
+    failureInjectionOn.value = enabled
+  }
+
+  /** 撤销拆分；子威胁已有会签时需要 force=true。 */
+  const undoThreatSplit = (operationId: string, force = false): void => {
+    const operation = data.value.splitOperations.find((item) => item.id === operationId)
+    const next = undoSplit(data.value, operationId, {
+      force,
+      now: new Date().toISOString(),
+      actor: '当前用户',
+    })
+    data.value = next
+    persist()
+    if (operation) markCheckpointUndone(operation.idempotencyKey, browserKV)
+  }
+
+  const splitUndoBlockers = (operationId: string): string[] =>
+    undoBlockers(data.value, operationId)
+
+  const splitOperationsForThreat = (threatId: string) =>
+    data.value.splitOperations.filter(
+      (operation) =>
+        operation.parentThreatId === threatId ||
+        operation.children.some((child) => child.id === threatId || child.parentThreatId === threatId),
+    )
+
   const resetDemo = (): void => {
     data.value = resetState()
     lastSavedAt.value = new Date().toISOString()
+    startupRecovery.value = null
   }
 
   const exportReport = (): string => {
@@ -263,6 +370,17 @@ export const useThreatModelStore = defineStore('threat-model', () => {
         (decision) =>
           `- ${decision.createdAt} ${decision.actor}（${decision.role}）${decision.decision}：${decision.comment}`,
       ),
+      '',
+      '## 威胁拆分谱系',
+      ...(data.value.splitOperations.length === 0
+        ? ['- 暂无拆分记录。']
+        : data.value.splitOperations.map((operation) => {
+            const statusLabel = operation.status === 'committed' ? '生效中' : '已撤销'
+            const children = operation.children
+              .map((child) => `${child.code} ${child.title}`)
+              .join('；')
+            return `- [${statusLabel}] ${operation.parentSnapshot.code} → ${children}（操作 ${operation.id}，${operation.createdAt}）`
+          })),
     ]
     return lines.join('\n')
   }
@@ -270,6 +388,10 @@ export const useThreatModelStore = defineStore('threat-model', () => {
   return {
     data,
     lastSavedAt,
+    lastMigrationAt,
+    startupRecovery,
+    failureInjectionOn,
+    pendingCheckpoints,
     metrics,
     issues,
     pendingReviews,
@@ -282,6 +404,13 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     updateMitigationStatus,
     acceptRisk,
     closeRisk,
+    submitSplit,
+    simulateConcurrentSplit,
+    recoverSplits,
+    toggleFailureInjection,
+    undoThreatSplit,
+    splitUndoBlockers,
+    splitOperationsForThreat,
     resetDemo,
     exportReport,
     reviewProgress,

@@ -8,15 +8,19 @@ import InputText from 'primevue/inputtext'
 import MultiSelect from 'primevue/multiselect'
 import Select from 'primevue/select'
 import Textarea from 'primevue/textarea'
+import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import ThreatSplitDialog from '@/components/ThreatSplitDialog.vue'
+import { SplitConflictError } from '@/services/splitEngine'
 import type { Threat } from '@/models/domain'
 import { createId } from '@/services/repository'
 import { useThreatModelStore } from '@/stores/threatModel'
 
 const store = useThreatModelStore()
 const toast = useToast()
+const confirm = useConfirm()
 
 const keyword = ref('')
 const severityFilter = ref<string | null>(null)
@@ -144,6 +148,65 @@ const addThreat = (): void => {
   editorVisible.value = true
 }
 
+const splitDialogVisible = ref(false)
+
+const openSplit = (): void => {
+  if (!selectedThreat.value) return
+  splitDialogVisible.value = true
+}
+
+const codeOf = (id: string): string =>
+  store.data.threats.find((threat) => threat.id === id)?.code ?? id
+
+const childThreats = computed(() =>
+  selectedThreat.value
+    ? store.data.threats.filter((threat) => threat.parentThreatId === selectedThreat.value?.id)
+    : [],
+)
+
+const parentThreat = computed(
+  () =>
+    store.data.threats.find((threat) => threat.id === selectedThreat.value?.parentThreatId) ?? null,
+)
+
+const lastSplitOperation = computed(() =>
+  selectedThreat.value
+    ? store.data.splitOperations.find(
+        (operation) =>
+          operation.parentThreatId === selectedThreat.value?.id && operation.status === 'committed',
+      ) ?? null
+    : null,
+)
+
+const requestUndo = (): void => {
+  if (!selectedThreat.value || !lastSplitOperation.value) return
+  const operationId = lastSplitOperation.value.id
+  const blockers = store.splitUndoBlockers(operationId)
+  const needsForce = blockers.some((message) => message.includes('会签意见'))
+  const message = needsForce
+    ? `${blockers.join('；')} 确认撤销将删除这些子威胁会签并恢复原会签，是否继续？`
+    : '将恢复主威胁拆分前状态，迁移的对象与缓解任务回到主威胁，原会签重新生效。是否继续？'
+  confirm.require({
+    header: '撤销威胁拆分',
+    message,
+    acceptLabel: needsForce ? '强制撤销' : '确认撤销',
+    rejectLabel: '取消',
+    accept: () => {
+      try {
+        store.undoThreatSplit(operationId, needsForce)
+        toast.add({ severity: 'success', summary: '拆分已撤销', detail: '主威胁已恢复，原会签重新生效。', life: 3500 })
+      } catch (error) {
+        toast.add({
+          severity: 'error',
+          summary: '撤销失败',
+          detail: error instanceof SplitConflictError ? error.message : '当前状态不允许撤销。',
+          life: 4500,
+        })
+      }
+    },
+  })
+}
+
 const saveThreat = (): void => {
   if (!threatForm.code.trim() || !threatForm.title.trim() || !threatForm.description.trim()) {
     toast.add({ severity: 'error', summary: '校验失败', detail: '编号、标题和描述不能为空', life: 3000 })
@@ -248,9 +311,14 @@ const saveThreat = (): void => {
           scrollHeight="640px"
           @row-click="({ data }) => (selectedId = data.id)"
         >
-          <Column field="code" header="编号" style="width: 92px">
+          <Column field="code" header="编号" style="width: 108px">
             <template #body="{ data }">
               <strong class="threat-code">{{ data.code }}</strong>
+              <i
+                v-if="data.parentThreatId"
+                class="pi pi-sitemap lineage-dot"
+                title="拆分子威胁"
+              ></i>
             </template>
           </Column>
           <Column field="title" header="威胁" />
@@ -276,8 +344,17 @@ const saveThreat = (): void => {
             <div>
               <div class="threat-code">{{ selectedThreat.code }}</div>
               <h2>{{ selectedThreat.title }}</h2>
+              <span v-if="selectedThreat.parentThreatId" class="lineage-chip">
+                <i class="pi pi-sitemap"></i> 子威胁 · 源自 {{ codeOf(selectedThreat.parentThreatId) }}
+              </span>
+              <span v-else-if="childThreats.length > 0" class="lineage-chip parent">
+                <i class="pi pi-sitemap"></i> 主威胁 · {{ childThreats.length }} 个子场景
+              </span>
             </div>
-            <Button icon="pi pi-pencil" label="编辑" outlined @click="editThreat" />
+            <div class="detail-actions">
+              <Button icon="pi pi-pencil" label="编辑" outlined @click="editThreat" />
+              <Button icon="pi pi-clone" label="拆分" severity="info" outlined @click="openSplit" />
+            </div>
           </div>
           <div class="status-line">
             <StatusTag :value="selectedThreat.severity" kind="severity" />
@@ -309,6 +386,28 @@ const saveThreat = (): void => {
             <div v-if="relatedPaths.length === 0" class="muted">尚未关联攻击路径。</div>
           </section>
 
+          <section class="detail-section" v-if="childThreats.length > 0 || parentThreat">
+            <h3>拆分谱系</h3>
+            <div v-if="parentThreat" class="lineage-line">
+              <span class="muted">父威胁</span>
+              <strong>{{ parentThreat.code }} {{ parentThreat.title }}</strong>
+            </div>
+            <div v-for="child in childThreats" :key="child.id" class="lineage-line">
+              <span class="muted">子威胁</span>
+              <strong>{{ child.code }} {{ child.title }}</strong>
+              <StatusTag :value="child.reviewStatus" kind="review" />
+            </div>
+            <Button
+              v-if="lastSplitOperation"
+              label="撤销本次拆分"
+              icon="pi pi-undo"
+              severity="warning"
+              text
+              size="small"
+              @click="requestUndo"
+            />
+          </section>
+
           <section class="detail-section">
             <h3>现有控制</h3>
             <div v-for="control in relatedControls" :key="control?.id" class="control-line">
@@ -323,6 +422,11 @@ const saveThreat = (): void => {
         <div v-else class="empty-state">从左侧选择一条威胁查看分析详情。</div>
       </aside>
     </div>
+
+    <ThreatSplitDialog
+      v-model:visible="splitDialogVisible"
+      :threat="selectedThreat"
+    />
 
     <Dialog
       v-model:visible="editorVisible"
@@ -475,6 +579,48 @@ const saveThreat = (): void => {
   color: #3268a6;
   font-family: monospace;
   font-size: 12px;
+}
+
+.lineage-dot {
+  margin-left: 6px;
+  color: #7b94b6;
+  font-size: 11px;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.lineage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 2px 9px;
+  border-radius: 10px;
+  background: #eef3fa;
+  color: #41658f;
+  font-size: 10px;
+}
+
+.lineage-chip.parent {
+  background: #eef7f0;
+  color: #34684c;
+}
+
+.lineage-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #e4e8ef;
+  border-radius: 5px;
+}
+
+.lineage-line + .lineage-line {
+  margin-top: 6px;
 }
 
 .detail-panel {

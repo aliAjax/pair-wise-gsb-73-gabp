@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc -b"
+    "typecheck": "vue-tsc -b",
+    "test:split": "node --no-warnings --loader ./scripts/ts-loader.mjs src/services/__tests__/splitEngine.test.ts && node --no-warnings --loader ./scripts/ts-loader.mjs src/services/__tests__/splitService.test.ts"
   },
   "dependencies": {
     "@apollo/client": "^3.12.7",
